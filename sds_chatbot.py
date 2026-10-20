@@ -85,21 +85,24 @@ class SDSChatbot:
             logger.warning("sentence-transformers not installed. RAG disabled.")
             return
 
-        self.embedder = SentenceTransformer('all-MiniLM-L6-v2')
-
-        if self.embedding_file.exists():
-            self.embeddings = np.load(self.embedding_file)
-            logger.info("Loaded cached SDS embeddings.")
-        else:
-            logger.info("Generating new embeddings for SDS dataset...")
-            texts_to_embed = []
-            for _, row in self.df.iterrows():
-                text = f"Chemical: {row.get('Chemical_Name', '')}. CAS: {row.get('CAS_Number', '')}. Hazards: {row.get('Hazards', '')}. First Aid: {row.get('First_Aid', '')}. Storage: {row.get('Handling_Storage', '')}. PPE: {row.get('PPE', '')}."
-                texts_to_embed.append(text)
-            
-            self.embeddings = self.embedder.encode(texts_to_embed, convert_to_numpy=True)
-            np.save(self.embedding_file, self.embeddings)
-            logger.info("Saved SDS embeddings to disk.")
+        try:
+            self.embedder = SentenceTransformer('all-MiniLM-L6-v2')
+            if self.embedding_file.exists():
+                self.embeddings = np.load(self.embedding_file)
+                logger.info("Loaded cached SDS embeddings.")
+            else:
+                logger.info("Generating new embeddings for SDS dataset...")
+                texts_to_embed = []
+                for _, row in self.df.iterrows():
+                    text = f"Chemical: {row.get('Chemical_Name', '')}. CAS: {row.get('CAS_Number', '')}. Hazards: {row.get('Hazards', '')}. First Aid: {row.get('First_Aid', '')}. Storage: {row.get('Handling_Storage', '')}. PPE: {row.get('PPE', '')}."
+                    texts_to_embed.append(text)
+                
+                self.embeddings = self.embedder.encode(texts_to_embed, convert_to_numpy=True)
+                np.save(self.embedding_file, self.embeddings)
+                logger.info("Saved SDS embeddings to disk.")
+        except Exception as e:
+            logger.warning(f"Could not load local SentenceTransformer: {e}. Falling back to zero-RAM keyword matching.")
+            self.embedder = None
 
     def _get_session(self, session_id: str) -> Dict[str, Any]:
         state = session_state.get()
@@ -110,18 +113,35 @@ class SDSChatbot:
         return state
 
     def semantic_search(self, query: str, limit: int = 3) -> List[Dict[str, Any]]:
-        if self.embeddings is None or self.embedder is None or self.df.empty:
+        if self.df.empty:
             return []
             
-        query_emb = self.embedder.encode([query], convert_to_numpy=True)
-        similarities = cosine_similarity(query_emb, self.embeddings)[0]
-        
-        top_indices = np.argsort(similarities)[::-1][:limit]
-        results = []
-        for idx in top_indices:
-            if similarities[idx] > 0.2: # basic threshold
-                results.append(self.df.iloc[idx].to_dict())
-        return results
+        # 1. Try dense vector search if available
+        if self.embeddings is not None and self.embedder is not None:
+            try:
+                query_emb = self.embedder.encode([query], convert_to_numpy=True)
+                similarities = cosine_similarity(query_emb, self.embeddings)[0]
+                top_indices = np.argsort(similarities)[::-1][:limit]
+                results = []
+                for idx in top_indices:
+                    if similarities[idx] > 0.15:
+                        results.append(self.df.iloc[idx].to_dict())
+                if results:
+                    return results
+            except Exception as e:
+                logger.warning(f"Embedding search error: {e}")
+
+        # 2. Ultra-lightweight Keyword Search Fallback (Zero RAM overhead)
+        q_lower = query.lower()
+        matched = []
+        for _, row in self.df.iterrows():
+            chem_name = str(row.get('Chemical_Name', '')).lower()
+            cas = str(row.get('CAS_Number', '')).lower()
+            if chem_name in q_lower or any(w in q_lower for w in chem_name.split()) or cas in q_lower:
+                matched.append(row.to_dict())
+                if len(matched) >= limit:
+                    break
+        return matched if matched else [self.df.iloc[0].to_dict()]
 
     def _build_context_str(self, semantic_results: List[Dict[str, Any]]) -> str:
         context_str = ""
